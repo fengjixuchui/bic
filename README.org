@@ -1,4 +1,7 @@
 * ~bic~: A C interpreter and API explorer
+
+  [[https://travis-ci.org/hexagonal-sun/bic][https://travis-ci.org/hexagonal-sun/bic.svg?branch=master]]
+
   This a project that allows developers to explore and test C-APIs using a read
   eval print loop, also known as a REPL.
 
@@ -10,7 +13,7 @@
    - [[https://gmplib.org/][GNU MP]]
 
    To build BIC, you'll need:
-   - [[https://www.gnu.org/software/flex/][GNU Flex]]
+   - [[https://github.com/westes/flex][Flex]]
    - [[https://www.gnu.org/software/bison/][GNU Bison]]
    - [[https://www.gnu.org/software/automake/][GNU Automake]]
    - [[https://www.gnu.org/software/m4/][GNU M4]]
@@ -31,6 +34,25 @@ autoreconf -i
 ./configure --enable-debug
 make
 make install
+#+end_example
+
+*** Docker
+    You can use docker to build and run bic with the following command:
+
+#+begin_example
+docker build -t bic https://github.com/hexagonal-sun/bic.git#master
+#+end_example
+
+    Once the image is build you can then run bic with:
+#+begin_example
+docker run -i bic
+#+end_example
+
+*** Arch Linux
+    If you are using Arch Linux, you can install bic from AUR:
+
+#+begin_example
+yay -S bic
 #+end_example
 
 ** Usage
@@ -82,13 +104,30 @@ BIC>
 BIC> 2 * 8 + fileno(f);
 19
     #+end_example
+
+**** The Inspector
+
+     You can use bic to obtain information about any variable or type that has
+     been declared by prefixing it's name with a ~?~. This special syntax only
+     works on a REPL but will allow you to obtain various characteristics about
+     types and variables. For example:
+
+     #+begin_example
+BIC> #include <stdio.h>
+BIC> ?stdout
+stdout is a pointer to a struct _IO_FILE.
+value of stdout is 0x7ff1325bc5c0.
+sizeof(stdout) = 8 bytes.
+stdout was declared at: /usr/include/stdio.h:138.
+     #+end_example
+
 *** Evaluating Files
     If you pass bic a source file as a command line argument it will evaluate
     it, by calling a =main()= function. For example, suppose we have the file
     ~test.c~ that contains the following:
 
     #+begin_src c
-int printf(const char *s, ...);
+#include <stdio.h>
 
 int factorial(int n)
 {
@@ -139,9 +178,9 @@ int main()
     specification of:
 
     - Object name, for example =T_ADD=.
-    - A human readable name, such as ~"Addition"~.
+    - A human readable name, such as ~Addition~.
     - A property name prefix, such as ~tADD~.
-    - A list of properties for this type, such as ~"LHS"~ and ~"RHS"~.
+    - A list of properties for this type, such as ~LHS~ and ~RHS~.
 
     The code to create an object with the above set of attributes would be:
 

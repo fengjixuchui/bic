@@ -2,7 +2,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.69])
-AC_INIT([bic], [v0.9], [dev@mattleach.net])
+AC_INIT([bic], [v0.9.1], [dev@mattleach.net])
 AC_CONFIG_SRCDIR([src/main.c])
 AC_CONFIG_HEADERS([config.h])
 AC_CANONICAL_BUILD
@@ -21,6 +21,7 @@ AC_PROG_AWK
 AC_PROG_INSTALL
 AC_PROG_CPP
 AC_PROG_MKDIR_P
+AC_PROG_RANLIB
 AM_PROG_AS
 
 AC_CHECK_PROG([expect],[expect],[yes],[no])
@@ -106,6 +107,7 @@ AC_CONFIG_FILES([Makefile
                  src/Makefile
                  src/x86_64/Makefile
                  src/aarch64/Makefile
+                 src/armv7l/Makefile
                  testsuite/Makefile])
 
 AC_OUTPUT

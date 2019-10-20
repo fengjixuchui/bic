@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <dlfcn.h>
 #include "config.h"
 #include "tree.h"
@@ -11,8 +12,14 @@
 #include "gc.h"
 #include "preprocess.h"
 
+#if defined(BUILD_LINUX)
+ #include <gnu/lib-names.h>
+#endif
+
 extern FILE* cfilein;
 extern int cfileparse();
+extern void cfile_parser_set_file(const char *fname);
+extern const char *parser_current_file;
 
 tree cfile_parse_head;
 GC_STATIC_TREE(cfile_parse_head);
@@ -22,14 +29,27 @@ GC_STATIC_TREE(cfile_parse_head);
  */
 void cfileerror(const char *str)
 {
-    fprintf(stderr, "Parser Error: %s:%d %s.\n", "<stdin>", cfilelloc.first_line, str);
+    fprintf(stderr, "Parser Error: %s:%d %s.\n", parser_current_file,
+            cfilelloc.first_line, str);
+
     exit(1);
 }
 
 static int parse_file(const char *fname)
 {
     int parse_result;
-    FILE *f = fopen(fname, "r");
+    FILE *f;
+    char *command;
+
+    asprintf(&command, "gcc -E \"%s\"", fname);
+
+    if (!command) {
+        fprintf(stderr, "Error: could not allocate preprocessor command.\n");
+        return 1;
+    }
+
+    f = popen(command, "r");
+    free(command);
 
     if (!f) {
         perror("Error: Could not open file");
@@ -39,6 +59,7 @@ static int parse_file(const char *fname)
     cfilein = f;
 
     inhibit_gc();
+    cfile_parser_set_file(fname);
     parse_result = cfileparse();
     enable_gc();
 
@@ -59,23 +80,51 @@ static void add_call_to_main(tree head)
 
 static void usage(char *progname)
 {
-    fprintf(stderr, "Usage: %s [-l library]... [--] [CFILE]\n", progname);
-    fprintf(stderr, "\n");
-    fprintf(stderr, "Arguments:\n");
-    fprintf(stderr, "  -l: Open the specified library for external symbol\n");
-    fprintf(stderr, "      resolution in the evaluator.\n");
-    fprintf(stderr, "\n");
-    fprintf(stderr, "  CFILE: Parse, evaluate and call a function called\n");
-    fprintf(stderr, "         `main' within the file.");
-    fprintf(stderr, "\n");
-    fprintf(stderr, "Note: if no CFILE is passed on the command line the\n");
-    fprintf(stderr, "REPL (Read, Eval, Print Loop) is started\n");
+    fprintf(stderr,
+            "Usage: %s [-v] [-I INCLUDE_DIR]... [-l library]... [--] [CFILE]\n"
+            "\n"
+            "Arguments:\n"
+            "  -l: Open the specified library for external symbol\n"
+            "      resolution in the evaluator.\n"
+            "\n"
+            "  -I: add INCLUDE_DIR to the header search path.  This allows the user to use\n"
+            "      #include directives to include a file that isn't in the default header\n"
+            "      search path.\n"
+            "\n"
+            "  -v: Print version information and exit.\n"
+            "\n"
+            "  CFILE: Parse, evaluate and call a function called\n"
+            "         `main' within the file."
+            "\n"
+            "Note: if no CFILE is passed on the command line the\n"
+            "REPL (Read, Eval, Print Loop) is started\n", progname);
+}
+
+static void print_version(char *progname)
+{
+    fprintf(stderr,
+            "This is " PACKAGE_STRING ".\n"
+            "\n"
+            "Enabled Features:\n"
+            "\n"
+            "   tree-check: "
+#ifdef ENABLE_TREE_CHECK
+            "yes\n"
+#else
+            "no\n"
+#endif
+        );
 }
 
 static int open_library(char *libname)
 {
     char *tmp, *full_library_name;
     int ret;
+
+#if defined(BUILD_LINUX)
+    if (!strcmp(libname, "m"))
+        libname = LIBM_SO;
+#endif
 
     /* First, attempt to open just the library, if it has been fully
      * specified. */
@@ -102,7 +151,7 @@ static int parse_args(int argc, char *argv[])
 {
     int opt;
 
-    while ((opt = getopt(argc, argv, "l:I:")) != -1) {
+    while ((opt = getopt(argc, argv, "vl:I:")) != -1) {
         switch (opt) {
         case 'l':
             if (!open_library(optarg)) {
@@ -116,6 +165,9 @@ static int parse_args(int argc, char *argv[])
         case 'I':
             preprocessor_add_include_dir(optarg);
             break;
+        case 'v':
+            print_version(argv[0]);
+            exit(EXIT_SUCCESS);
         default: /* '?' */
             usage(argv[0]);
             exit(EXIT_FAILURE);

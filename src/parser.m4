@@ -16,12 +16,27 @@ int TARGET()lex(void);
 void TARGET()error(const char *str);
 
 extern tree TARGET()_parse_head;
+CFILE_ONLY
+    const char *parser_current_file;
+REPL_ONLY
+    const char *parser_current_file = "<REPL>";
+ALL_TARGETS
 
 static void set_locus(tree t, YYLTYPE locus)
 {
-    t->locus.line_no = locus.first_line;
-    t->locus.column_no = locus.first_column;
+    tLOCUS(t).line_no = locus.first_line;
+    tLOCUS(t).column_no = locus.first_column;
+
+    if(parser_current_file)
+        tLOCUS(t).file = get_identifier(parser_current_file);
 }
+
+CFILE_ONLY
+    void cfile_parser_set_file(const char *fname)
+    {
+        parser_current_file = fname;
+    }
+ALL_TARGETS
 
 static tree build_func_ptr(tree ret_type, tree ret_type_ptr,
                            tree ptr, tree id, tree args)
@@ -61,6 +76,42 @@ static tree build_func_ptr(tree ret_type, tree ret_type_ptr,
     return decl;
 }
 
+static tree handle_declaration(tree type, tree declarator_list)
+{
+    tree decl = tree_make(T_DECL);
+    tDECL_TYPE(decl) = type;
+    tDECL_DECLS(decl) = declarator_list;
+
+    /* Check to see if `type' is a typedef. If so, add all identifiers
+     * in `declarator_list' to the type_names list.  This will make
+     * the lexer tokenise all subsequent instances of the identifier
+     * string as a TYPE_NAME token. */
+    if (is_T_TYPEDEF(type)) {
+        tree i;
+        for_each_tree(i, declarator_list) {
+            tree oldid = i;
+
+            while (is_T_POINTER(oldid))
+                oldid = tPTR_EXP(oldid);
+
+            if (is_T_DECL_FN(oldid))
+                oldid = tFNDECL_NAME(oldid);
+
+            if (is_T_ARRAY(oldid))
+               oldid = tARRAY_ID(oldid);
+
+            if (!is_T_IDENTIFIER(oldid)) {
+                yyerror("Expected identifier when processing typedef");
+                return NULL;
+            }
+
+            add_typename(oldid);
+        }
+    }
+
+    return decl;
+}
+
 
 %}
 
@@ -72,20 +123,21 @@ static tree build_func_ptr(tree ret_type, tree ret_type_ptr,
     tree tree;
 }
 
-%error-verbose
+%define parse.error verbose
 %locations
 
 %define api.prefix {TARGET}
 
 %token AUTO BREAK CASE CHAR CONST CONTINUE DEFAULT DO
-%token DOUBLE ELSE ENUM EXTERN FLOAT FOR GOTO IF INT LONG
+%token DOUBLE ENUM EXTERN FLOAT FOR GOTO IF INT LONG
 %token REGISTER RETURN SHORT SIGNED SIZEOF STATIC STRUCT
 %token SWITCH TYPEDEF UNION UNSIGNED VOID WHILE
 %token EQUATE NOT_EQUATE LESS_OR_EQUAL GREATER_OR_EQUAL
 %token SHIFT_LEFT SHIFT_RIGHT BOOL_OP_AND BOOL_OP_OR INC
-%token DEC ELLIPSIS PTR_ACCESS BOOL REPL
+%token DEC ELLIPSIS PTR_ACCESS BOOL REPL ADD_ASSIGN SUB_ASSIGN
+%token DIV_ASSIGN LSHIFT_ASSIGN RSHIFT_ASSIGN XOR_ASSIGN
 
-%nonassoc ELSE
+%right ')' ELSE
 
 %token <tree> IDENTIFIER
 REPL_ONLY
@@ -105,8 +157,9 @@ CFILE_ONLY
 %type <tree> jump_statement
 %type <tree> repl_statement
 REPL_ONLY
-%type <tree> declaration_statement
+%type <tree> inspection_statement
 ALL_TARGETS
+%type <tree> declaration_statement
 %type <tree> func_ptr_decl
 %type <tree> argument_specifier
 %type <tree> direct_argument_list
@@ -125,13 +178,18 @@ ALL_TARGETS
 %type <tree> multiplicative_expression
 %type <tree> additive_expression
 %type <tree> shift_expression
-%type <tree> inclusive_expression
+%type <tree> and_expression
+%type <tree> exclusive_or_expression
+%type <tree> inclusive_or_expression
 %type <tree> relational_expression
-%type <tree> logical_expression
+%type <tree> equality_expression
+%type <tree> logical_or_expression
+%type <tree> logical_and_expression
 %type <tree> assignment_expression
-%type <tree> binary_modify_expression
-%type <tree> infix_expression
-%type <tree> decl
+%type <tree> expression
+%type <tree> conditional_expression
+%type <tree> constant_expression
+%type <tree> direct_declarator
 %type <tree> decl_possible_pointer
 %type <tree> pointer
 %type <tree> declarator
@@ -146,7 +204,10 @@ ALL_TARGETS
 %type <tree> direct_type_specifier
 %type <tree> sizeof_specifier
 %type <tree> type_specifier
-%type <tree> compound_declarator
+%type <tree> struct_declaration_list
+%type <tree> struct_declaration
+%type <tree> struct_declarator_list
+%type <tree> struct_declarator
 %type <tree> declaration
 %type <tree> declaration_list
 
@@ -195,10 +256,6 @@ ALL_TARGETS
 
 argument_specifier
 : '(' ')'
-{
-    $$ = NULL;
-}
-| '(' VOID ')'
 {
     $$ = NULL;
 }
@@ -253,6 +310,16 @@ argument_decl
 | func_ptr_decl
 ;
 
+REPL_ONLY
+    inspection_statement
+    : '?' IDENTIFIER
+    {
+        tree inspect = tree_make(T_INSPECT);
+        tINSPECT_EXP(inspect) = $2;
+        $$ = inspect;
+    }
+ALL_TARGETS
+
 statement
 : expression_statement
 | iteration_statement
@@ -263,6 +330,7 @@ CFILE_ONLY
     | repl_statement
 REPL_ONLY
     | declaration_statement
+    | inspection_statement
     | C_PRE_INC
     {
         tree ret = tree_make(CPP_INCLUDE);
@@ -294,16 +362,26 @@ CFILE_ONLY
         $$ = $2;
     }
     ;
-REPL_ONLY
-    declaration_statement
-    : declaration ';'
-    ;
 ALL_TARGETS
 
+declaration_statement
+: declaration ';'
+;
+
+expression
+: assignment_expression
+| expression ',' assignment_expression
+{
+    tree comma = tree_make(T_COMMA);
+    tCOMMA_LHS(comma) = $1;
+    tCOMMA_RHS(comma) = $3;
+    set_locus(comma, @2);
+    $$ = comma;
+}
+;
 
 expression_statement
-: assignment_expression ';'
-| binary_modify_expression ';'
+: expression ';'
 ;
 
 iteration_statement
@@ -316,6 +394,16 @@ iteration_statement
     tFLOOP_STMTS(for_loop) = $7;
     set_locus(for_loop, @1);
     $$ = for_loop;
+}
+| FOR '(' declaration_statement expression_statement assignment_expression ')' statement
+{
+tree for_loop = tree_make(T_LOOP_FOR);
+tFLOOP_INIT(for_loop) = $3;
+tFLOOP_COND(for_loop) = $4;
+tFLOOP_AFTER(for_loop) = $5;
+tFLOOP_STMTS(for_loop) = $7;
+set_locus(for_loop, @1);
+$$ = for_loop;
 }
 | WHILE '(' assignment_expression ')' statement
 {
@@ -360,6 +448,10 @@ CFILE_ONLY
         tRET_EXP(ret) = $2;
         $$ = ret;
     }
+    | BREAK ';'
+    {
+        $$ = tree_make(T_BREAK);
+    }
     ;
 ALL_TARGETS
 
@@ -402,7 +494,7 @@ primary_expression
     set_locus(str, @1);
     $$ = str;
 }
-| '(' assignment_expression ')'
+| '(' expression ')'
 {
     $$ = $2;
 }
@@ -426,7 +518,7 @@ postfix_expression
     set_locus(fncall, @1);
     $$ = fncall;
 }
-| postfix_expression '[' assignment_expression ']'
+| postfix_expression '[' expression ']'
 {
     tree arr_access = tree_make(T_ARRAY_ACCESS);
     tARR_ACCESS_OBJ(arr_access) = $1;
@@ -532,7 +624,7 @@ unary_expression
 
 cast_expression
 : unary_expression
-| '(' direct_type_specifier ')' unary_expression
+| '(' direct_type_specifier ')' cast_expression
 {
     tree cast = tree_make(T_CAST);
     tCAST_NEWTYPE(cast) = $2;
@@ -643,7 +735,11 @@ relational_expression
     set_locus(gtoreq, @2);
     $$ = gtoreq;
 }
-| relational_expression EQUATE shift_expression
+;
+
+equality_expression
+: relational_expression
+| equality_expression EQUATE relational_expression
 {
     tree equal = tree_make(T_EQ);
     tEQ_LHS(equal) = $1;
@@ -651,7 +747,7 @@ relational_expression
     set_locus(equal, @2);
     $$ = equal;
 }
-| relational_expression NOT_EQUATE shift_expression
+| equality_expression NOT_EQUATE relational_expression
 {
     tree not_equal = tree_make(T_N_EQ);
     tN_EQ_LHS(not_equal) = $1;
@@ -661,17 +757,9 @@ relational_expression
 }
 ;
 
-inclusive_expression
-: relational_expression
-| inclusive_expression '|' relational_expression
-{
-    tree inclusive_or = tree_make(T_I_OR);
-    tI_OR_LHS(inclusive_or) = $1;
-    tI_OR_RHS(inclusive_or) = $3;
-    set_locus(inclusive_or, @2);
-    $$ = inclusive_or;
-}
-| inclusive_expression '&' relational_expression
+and_expression
+: equality_expression
+| and_expression '&' equality_expression
 {
     tree inclusive_and = tree_make(T_I_AND);
     tI_AND_LHS(inclusive_and) = $1;
@@ -681,17 +769,32 @@ inclusive_expression
 }
 ;
 
-logical_expression
-: inclusive_expression
-| logical_expression BOOL_OP_OR inclusive_expression
+exclusive_or_expression
+: and_expression
+| exclusive_or_expression '^' and_expression
 {
-    tree logicor = tree_make(T_L_OR);
-    tL_OR_LHS(logicor) = $1;
-    tL_OR_RHS(logicor) = $3;
-    set_locus(logicor, @2);
-    $$ = logicor;
+    tree exclusive_or = tree_make(T_X_OR);
+    tX_OR_LHS(exclusive_or) = $1;
+    tX_OR_RHS(exclusive_or) = $3;
+    set_locus(exclusive_or, @2);
+    $$ = exclusive_or;
 }
-| logical_expression BOOL_OP_AND inclusive_expression
+;
+
+inclusive_or_expression
+: exclusive_or_expression
+| inclusive_or_expression '|' exclusive_or_expression
+{
+    tree inclusive_or = tree_make(T_I_OR);
+    tI_OR_LHS(inclusive_or) = $1;
+    tI_OR_RHS(inclusive_or) = $3;
+    set_locus(inclusive_or, @2);
+    $$ = inclusive_or;
+}
+
+logical_and_expression
+: inclusive_or_expression
+| logical_and_expression BOOL_OP_AND inclusive_or_expression
 {
     tree logicand = tree_make(T_L_AND);
     tL_AND_LHS(logicand) = $1;
@@ -699,11 +802,22 @@ logical_expression
     set_locus(logicand, @2);
     $$ = logicand;
 }
+
+logical_or_expression
+: logical_and_expression
+| logical_or_expression BOOL_OP_OR logical_and_expression
+{
+    tree logicor = tree_make(T_L_OR);
+    tL_OR_LHS(logicor) = $1;
+    tL_OR_RHS(logicor) = $3;
+    set_locus(logicor, @2);
+    $$ = logicor;
+}
 ;
 
-infix_expression
-: logical_expression
-| logical_expression '?' primary_expression ':' primary_expression
+conditional_expression
+: logical_or_expression
+| logical_or_expression '?' expression ':' conditional_expression
 {
     tree infix = tree_make(T_INFIX);
     tINFIX_COND(infix) = $1;
@@ -712,9 +826,13 @@ infix_expression
     $$ = infix;
 }
 
+constant_expression
+: conditional_expression
+;
+
 assignment_expression
-: infix_expression
-| unary_expression '=' infix_expression
+: conditional_expression
+| unary_expression '=' assignment_expression
 {
     tree assign = tree_make(T_ASSIGN);
     tASSIGN_LHS(assign) = $1;
@@ -722,32 +840,33 @@ assignment_expression
     set_locus(assign, @2);
     $$ = assign;
 }
+| unary_expression ADD_ASSIGN assignment_expression
+{
+    $$ = tree_make_binmod(T_ADD, tADD, $1, $3);
+}
+| unary_expression SUB_ASSIGN assignment_expression
+{
+    $$ = tree_make_binmod(T_SUB, tSUB, $1, $3);
+}
+| unary_expression  DIV_ASSIGN assignment_expression
+{
+    $$ = tree_make_binmod(T_DIV, tDIV, $1, $3);
+}
+| unary_expression LSHIFT_ASSIGN assignment_expression
+{
+    $$ = tree_make_binmod(T_LSHIFT, tLSHIFT, $1, $3);
+}
+| unary_expression RSHIFT_ASSIGN assignment_expression
+{
+    $$ = tree_make_binmod(T_RSHIFT, tRSHIFT, $1, $3);
+}
+| unary_expression XOR_ASSIGN assignment_expression
+{
+$$ = tree_make_binmod(T_X_OR, tX_OR, $1, $3);
+}
 ;
 
-binary_modify_expression
-: primary_expression '+' '=' primary_expression
-{
-    $$ = tree_make_binmod(T_ADD, tADD, $1, $4);
-}
-| primary_expression '-' '=' infix_expression
-{
-    $$ = tree_make_binmod(T_SUB, tSUB, $1, $4);
-}
-| primary_expression '/' '=' infix_expression
-{
-    $$ = tree_make_binmod(T_DIV, tDIV, $1, $4);
-}
-| primary_expression SHIFT_LEFT '=' infix_expression
-{
-    $$ = tree_make_binmod(T_LSHIFT, tLSHIFT, $1, $4);
-}
-| primary_expression SHIFT_RIGHT '=' infix_expression
-{
-    $$ = tree_make_binmod(T_RSHIFT, tRSHIFT, $1, $4);
-}
-;
-
-decl
+direct_declarator
 : IDENTIFIER
 {
     tree id = $1;
@@ -772,7 +891,7 @@ decl
     set_locus(tFNDECL_NAME(fn_decl), @2);
     $$ = fn_decl;
 }
-| decl '[' additive_expression ']'
+| direct_declarator '[' additive_expression ']'
 {
     tree array = tree_make(T_ARRAY);
     tARRAY_ID(array) = $1;
@@ -780,7 +899,7 @@ decl
     set_locus(array, @2);
     $$ = array;
 }
-| decl '[' ']'
+| direct_declarator '[' ']'
 {
     tree ptr = tree_make(T_POINTER);
     tPTR_EXP(ptr) = $1;
@@ -806,8 +925,8 @@ pointer
 ;
 
 decl_possible_pointer
-: decl
-| pointer decl
+: direct_declarator
+| pointer direct_declarator
 {
     $$ = make_pointer_type($1, $2);
 }
@@ -1067,7 +1186,7 @@ direct_type_specifier
 
 sizeof_specifier
 : direct_type_specifier
-| primary_expression
+| unary_expression
 | direct_type_specifier pointer
 {
     $$ = make_pointer_type($2, $1);
@@ -1099,7 +1218,7 @@ type_specifier
 ;
 
 struct_specifier
-: STRUCT IDENTIFIER '{' declaration_list '}'
+: STRUCT IDENTIFIER '{' struct_declaration_list '}'
 {
     char *struct_name = concat_strings("struct ", tID_STR($2));
     tree decl = tree_make(T_DECL_COMPOUND);
@@ -1110,7 +1229,7 @@ struct_specifier
     set_locus(tCOMP_DECL_ID(decl), @2);
     $$ = decl;
 }
-| STRUCT '{' declaration_list '}'
+| STRUCT '{' struct_declaration_list '}'
 {
     tree decl = tree_make(T_DECL_COMPOUND);
     tCOMP_DECL_ID(decl) = NULL;
@@ -1239,7 +1358,7 @@ enumerator
     set_locus(id, @1);
     $$ = id;
 }
-| IDENTIFIER '=' logical_expression
+| IDENTIFIER '=' logical_or_expression
 {
     tree id = $1;
     set_locus(id, @1);
@@ -1291,38 +1410,9 @@ func_ptr_decl
 declaration
 : type_specifier declarator_list
 {
-    tree decl = tree_make(T_DECL);
-    tDECL_TYPE(decl) = $1;
-    tDECL_DECLS(decl) = $2;
+    tree decl = handle_declaration($1, $2);
     set_locus(decl, @1);
     $$ = decl;
-
-    /* Check to see if `type_specifier' is a typedef. If so, add all
-     * identifiers in `declarator_list' to the type_names list.  This
-     * will make the lexer tokenise all subsequent instances of the
-     * identifier string as a TYPE_NAME token. */
-    if (is_T_TYPEDEF($1)) {
-        tree i;
-        for_each_tree(i, $2) {
-            tree oldid = i;
-
-            while (is_T_POINTER(oldid))
-                oldid = tPTR_EXP(oldid);
-
-            if (is_T_DECL_FN(oldid))
-                oldid = tFNDECL_NAME(oldid);
-
-            if (is_T_ARRAY(oldid))
-               oldid = tARRAY_ID(oldid);
-
-            if (!is_T_IDENTIFIER(oldid)) {
-                yyerror("Expected identifier when processing typedef");
-                YYERROR;
-            }
-
-            add_typename(oldid);
-        }
-    }
 }
 CFILE_ONLY
     | func_ptr_decl
@@ -1337,23 +1427,70 @@ CFILE_ONLY
 ALL_TARGETS
 ;
 
-compound_declarator
-: declaration
-| declaration ':' unary_expression
+struct_declaration_list
+: struct_declaration
 {
-    tree bitfield_expr = tree_make(T_BITFIELD_EXPR);
-    tBITFIELD_EXPR_SZ(bitfield_expr) = $3;
-    tBITFIELD_EXPR_DECL(bitfield_expr) = $1;
-    $$ = bitfield_expr;
+  $$ = tree_chain_head($1);
+}
+| struct_declaration_list struct_declaration
+{
+  tree_chain($2, $1);
+}
+;
+
+struct_declaration
+: type_specifier struct_declarator_list ';'
+{
+    tree decl = handle_declaration($1, $2);
+    set_locus(decl, @1);
+    $$ = decl;
+}
+| type_specifier ';'
+{
+    tree decl = handle_declaration($1, NULL);
+    set_locus(decl, @1);
+    $$ = decl;
+}
+| func_ptr_decl ';'
+;
+
+struct_declarator_list
+: struct_declarator
+{
+    $$ = tree_chain_head($1);
+}
+| struct_declarator_list ',' struct_declarator
+{
+    tree_chain($3, $1);
+}
+;
+
+struct_declarator
+: declarator
+| ':' constant_expression
+{
+    tree bitfield = tree_make(T_BITFIELD);
+    tBITFIELD_SZ(bitfield) = $2;
+    tBITFIELD_DECLARATOR(bitfield) = NULL;
+    set_locus(bitfield, @1);
+    $$ = bitfield;
+}
+| declarator ':' constant_expression
+{
+    tree bitfield = tree_make(T_BITFIELD);
+    tBITFIELD_SZ(bitfield) = $3;
+    tBITFIELD_DECLARATOR(bitfield) = $1;
+    set_locus(bitfield, @2);
+    $$ = bitfield;
 }
 ;
 
 declaration_list
-: compound_declarator ';'
+: declaration ';'
 {
     $$ = tree_chain_head($1);
 }
-| declaration_list compound_declarator ';'
+| declaration_list declaration ';'
 {
     tree_chain($2, $1);
 }

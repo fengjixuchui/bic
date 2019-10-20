@@ -51,5 +51,14 @@ loops
 negate
 iand
 factorial
+char-decl-and-assignment
+for-loop-init-decl
+sizeof-deref
+break
+comma
+modulo
+multi_assign
+xor
+encrypt-decrypt
 
 *.trs

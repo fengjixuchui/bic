@@ -1,6 +1,5 @@
-void free(void *ptr);
-void *malloc(int length);
-int printf(char *s, ...);
+#include <stdio.h>
+#include <stdlib.h>
 
 typedef struct {
     int a, b;
@@ -16,6 +15,12 @@ int main()
             void *bacl;
             char *str, ch;
             s1 pan;
+        };
+
+        struct funcptr
+        {
+            int * (*funcptr)(void *arg);
+            int arg;
         };
 
         struct {

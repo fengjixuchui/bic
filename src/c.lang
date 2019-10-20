@@ -48,6 +48,9 @@
 (deftype T_POINTER "Pointer" "tPTR"
          ("EXP"))
 
+(deftype T_INSPECT "Inspect Identifier" "tINSPECT"
+         ("EXP"))
+
 (deftype T_MUL "Multiply" "tMUL"
          ("LHS" "RHS"))
 
@@ -93,10 +96,16 @@
 (deftype T_I_OR "Inclusive OR" "tI_OR"
          ("LHS" "RHS"))
 
+(deftype T_X_OR "Exclusive OR" "tX_OR"
+         ("LHS" "RHS"))
+
 (deftype T_I_AND "Inclusive AND" "tI_AND"
          ("LHS" "RHS"))
 
 (deftype T_L_AND "Logical AND" "tL_AND"
+         ("LHS" "RHS"))
+
+(deftype T_COMMA "Comma operator" "tCOMMA"
          ("LHS" "RHS"))
 
 (deftype T_IF "If" "tIF"
@@ -117,8 +126,8 @@
 (deftype T_STATIC "Static" "tSTATIC"
          ("EXP"))
 
-(deftype T_BITFIELD_EXPR "Bitfield expression" "tBITFIELD_EXPR"
-         ("SZ" "DECL"))
+(deftype T_BITFIELD "Bitfield declarator" "tBITFIELD"
+         ("SZ" "DECLARATOR"))
 
 (deftype T_COMP_ACCESS "Compound Access" "tCOMP_ACCESS"
          ("OBJ" "MEMBER"))
@@ -172,6 +181,8 @@
 (deftype T_RETURN "Function return" "tRET"
          ("EXP"))
 
+(deftype T_BREAK "Break statement")
+
 (deftype T_REPL "Switch to REPL")
 
 (deftype T_ENUMERATOR "Enumerator" "tENUM"
@@ -213,18 +224,18 @@
 (deftype T_EXT_FUNC "External function" "tEXT_FUNC"
          ("NAME" "FNDECL"))
 
-(defctype D_T_CHAR "Signed Char type" "int8_t" "d")
-(defctype D_T_SHORT "Signed Short type" "int16_t" "hd")
-(defctype D_T_INT "Signed Integer type" "int32_t" "d")
-(defctype D_T_LONG "Signed Long type" "int64_t" "ld")
-(defctype D_T_LONGLONG "Signed Long Long type" "int64_t" "ld")
-(defctype D_T_UCHAR "Unsigned Char type" "uint8_t" "u")
-(defctype D_T_USHORT "Signed Short type" "int16_t" "hu")
-(defctype D_T_UINT "Unsigned Integer type" "uint32_t" "u")
-(defctype D_T_ULONG "Unsigned Long type" "uint64_t" "lu")
-(defctype D_T_ULONGLONG "Unsigned Long Long type" "uint64_t" "lu")
-(defctype D_T_FLOAT "Floating point type" "float" "f")
-(defctype D_T_DOUBLE "Double floating point type" "double" "f")
-(defctype D_T_LONGDOUBLE "Long double floating point type" "long double" "Lf")
-(defctype D_T_PTR "Pointer type" "void *" "p" "tDTPTR"
+(defctype D_T_CHAR "signed char" "char" "d" "ival")
+(defctype D_T_SHORT "signed short" "short" "hd" "ival")
+(defctype D_T_INT "signed integer" "int" "d" "ival")
+(defctype D_T_LONG "signed long" "long" "ld" "ival")
+(defctype D_T_LONGLONG "signed long long" "long long" "ld" "ival")
+(defctype D_T_UCHAR "unsigned char" "unsigned char" "u" "ival")
+(defctype D_T_USHORT "signed short" "unsigned short" "hu" "ival")
+(defctype D_T_UINT "unsigned integer" "unsigned int" "u" "ival")
+(defctype D_T_ULONG "unsigned long" "unsigned long" "lu" "ival")
+(defctype D_T_ULONGLONG "unsigned long long" "unsigned long long" "lu" "ival")
+(defctype D_T_FLOAT "float" "float" "f" "dval")
+(defctype D_T_DOUBLE "double" "double" "f" "dval")
+(defctype D_T_LONGDOUBLE "long double" "long double" "Lf" "dval")
+(defctype D_T_PTR "pointer" "void *" "p" "ival" "tDTPTR"
           ("EXP"))

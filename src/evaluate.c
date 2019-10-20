@@ -17,6 +17,7 @@
 #include "repl.h"
 #include "gc.h"
 #include "preprocess.h"
+#include "inspect.h"
 
 static tree cur_ctx = NULL;
 GC_STATIC_TREE(cur_ctx);
@@ -241,9 +242,9 @@ static tree make_int_from_live_var(tree var)
     tree type = tLV_TYPE(var);
 
     switch (TYPE(type)) {
-#define SETINT(type)                                                    \
-        case type:                                                      \
-            mpz_init_set_si(tINT_VAL(ret), (int64_t)tLV_VAL(var)->type);\
+#define SETINT(type)                                                       \
+        case type:                                                         \
+            mpz_init_set_si(tINT_VAL(ret), (ptrdiff_t)tLV_VAL(var)->type); \
             break;
         SETINT(D_T_CHAR);
         SETINT(D_T_SHORT);
@@ -290,7 +291,7 @@ static tree convert_to_comparable_type(tree t, int depth)
     return ret;
 }
 
-#define DEFCTYPE(tname, desc, ctype, fmt)                               \
+#define DEFCTYPE(tname, desc, ctype, fmt, ffmem)                        \
     static inline tree convert_int_to_##tname(tree intval)              \
     {                                                                   \
         tree dest_type = tree_make(tname);                              \
@@ -303,7 +304,7 @@ static tree convert_to_comparable_type(tree t, int depth)
 #include "ctypes.def"
 #undef DEFCTYPE
 
-static tree make_fncall_result(tree type, ptrdiff_t result)
+static tree make_fncall_result(tree type, union function_return result)
 {
     tree ret;
 
@@ -317,9 +318,9 @@ static tree make_fncall_result(tree type, ptrdiff_t result)
 
     switch (TYPE(type))
     {
-#define DEFCTYPE(TNAME, DESC, CTYPE, FMT)             \
-        case TNAME:                                   \
-            tLV_VAL(ret)->TNAME = (CTYPE)result;      \
+#define DEFCTYPE(TNAME, DESC, CTYPE, FMT, FFMEM)               \
+        case TNAME:                                            \
+            tLV_VAL(ret)->TNAME = (CTYPE)result.FFMEM;         \
             break;
 #include "ctypes.def"
 #undef DEFCTYPE
@@ -465,17 +466,27 @@ static tree eval_fn_call(tree t, int depth)
     if (is_T_DECL_FN(function)) {
         tree fn_arg_chain = NULL, args = tFNCALL_ARGS(t);
         char *function_name = tID_STR(tFNDECL_NAME(function));
-        ptrdiff_t res;
+        tree i;
+        union function_return res;
         void *function_address = dlsym(RTLD_DEFAULT, function_name);
+        bool is_variadic = false;
 
         if (function_address == NULL)
             eval_die(t, "Could not resolve external symbol: %s\n", function_name);
+
+
+        for_each_tree(i, tFNDECL_ARGS(function))
+            if (is_T_VARIADIC(i)){
+                is_variadic = true;
+                break;
+            }
 
         /* Evaluate all arguments before passing into the marshalling
          * function. */
         fn_arg_chain = eval_fn_args(args, depth);
 
-        res = do_call(function_address, fn_arg_chain);
+        res = do_call(function_address, fn_arg_chain, tFNDECL_RET_TYPE(function),
+                      is_variadic);
 
         return make_fncall_result(tFNDECL_RET_TYPE(function), res);
     }
@@ -483,8 +494,9 @@ static tree eval_fn_call(tree t, int depth)
     if (is_T_LIVE_VAR(function)) {
         tree fn_arg_chain, args = tFNCALL_ARGS(t),
             live_var_type = tLV_TYPE(function),
-            function_type;
-        ptrdiff_t res;
+            function_type, i;
+        bool is_variadic = false;
+        union function_return res;
 
         if (!is_D_T_PTR(live_var_type))
             eval_die(t, "could not call non-pointer type\n");
@@ -494,11 +506,18 @@ static tree eval_fn_call(tree t, int depth)
         if (!is_T_DECL_FN(function_type))
             eval_die(t, "could not call non-function pointer type\n");
 
+        for_each_tree(i, tFNDECL_ARGS(function_type))
+            if (is_T_VARIADIC(i)){
+                is_variadic = true;
+                break;
+            }
+
         /* Evaluate all arguments before passing into the marshalling
          * function. */
         fn_arg_chain = eval_fn_args(args, depth);
 
-        res = do_call(tLV_VAL(function)->D_T_PTR, fn_arg_chain);
+        res = do_call(tLV_VAL(function)->D_T_PTR, fn_arg_chain,
+                      tFNDECL_RET_TYPE(function_type), is_variadic);
 
         return make_fncall_result(tFNDECL_RET_TYPE(function_type), res);
 
@@ -516,13 +535,18 @@ static tree eval_fn_def(tree t, int depth)
 
 static void make_and_map_live_var(tree id, tree type)
 {
+    tree live_var;
+
     assert(TYPE(id) == T_IDENTIFIER);
 
     if (is_E_INCOMP_TYPE(type))
         eval_die(id, "Can not create incomplete type %s\n",
                  tID_STR(id));
 
-    map_identifier(id, make_live_var(type));
+    live_var = make_live_var(type);
+    tLOCUS(live_var) = tLOCUS(id);
+
+    map_identifier(id, live_var);
 }
 
 static size_t get_array_size(tree array_decl, tree base_type, int depth)
@@ -576,6 +600,9 @@ static void handle_struct_decl(tree decl, tree live_struct, int depth)
     void *base = tLV_COMP_BASE(live_struct);
 
     resolve_ptr_type(&decl_element, &decl_type);
+
+    if (is_T_BITFIELD(decl_element))
+        decl_element = tBITFIELD_DECLARATOR(decl_element);
 
     if (is_T_ARRAY(decl_element)) {
         size_t array_sz = get_array_size(decl_element, decl_type, depth);
@@ -645,9 +672,9 @@ static tree alloc_array(tree array_decl, tree base_type, int depth)
     return live_var;
 }
 
-static tree handle_decl(tree decl, tree base_type, int depth)
+static tree handle_declarator(tree decl, tree type, int depth)
 {
-    tree decl_type = base_type;
+    tree decl_type = type;
 
     /* Strip off any pointer objects and add them to the base type. */
     resolve_ptr_type(&decl, &decl_type);
@@ -683,9 +710,19 @@ static tree handle_decl(tree decl, tree base_type, int depth)
         tFNDECL_RET_TYPE(decl) = decl_type;
         map_identifier(tFNDECL_NAME(decl), decl);
         return decl;
+    case T_BITFIELD:
+        if (tBITFIELD_DECLARATOR(decl))
+            return handle_declarator(tBITFIELD_DECLARATOR(decl), type, depth);
+
+        return NULL;
     case T_ASSIGN:
     {
-        tree ret = handle_decl(tASSIGN_LHS(decl), base_type, depth);
+        tree ret = handle_declarator(tASSIGN_LHS(decl), type, depth);
+
+        /* handle_declarator will have stripped off any pointers from the decl name.
+         * Therefore ret now becomes the LHS of the assignment. */
+        tASSIGN_LHS(decl) = ret;
+
         __evaluate_1(decl, depth + 1);
         return ret;
     }
@@ -823,6 +860,7 @@ static tree handle_extern_decl(tree extern_type, tree decl)
     live_var = tree_make(T_LIVE_VAR);
     tLV_TYPE(live_var) = extern_type;
     tLV_VAL(live_var) = sym_addr;
+    tLOCUS(live_var) = tLOCUS(id);
 
     map_identifier(id, live_var);
 
@@ -859,6 +897,15 @@ static tree eval_ext_func(tree t, int depth)
     tLV_VAL(live_var)->D_T_PTR = func_addr;
 
     return __evaluate_1(live_var, depth + 1);
+}
+
+static tree eval_inspect(tree t, int depth)
+{
+    tree object = resolve_identifier(tINSPECT_EXP(t), SCOPE_GLOBAL);
+
+    inspect(tINSPECT_EXP(t), object);
+
+    return NULL;
 }
 
 static tree handle_extern(tree extern_type, tree decls, int depth)
@@ -932,9 +979,9 @@ static tree handle_static_decl(tree decl, int depth)
     push_ctx("Static declaration");
     if (is_CHAIN_HEAD(decls))
         for_each_tree(i, decls)
-            ret = handle_decl(i, base_type, depth);
+            ret = handle_declarator(i, base_type, depth);
     else
-        ret = handle_decl(decls, base_type, depth);
+        ret = handle_declarator(decls, base_type, depth);
 
     TYPE(decl) = E_CTX;
 
@@ -976,9 +1023,9 @@ static tree eval_decl(tree t, int depth)
 
     if (is_CHAIN_HEAD(decls))
         for_each_tree(i, decls)
-            ret = handle_decl(i, base_type, depth);
+            ret = handle_declarator(i, base_type, depth);
     else
-        ret = handle_decl(decls, base_type, depth);
+        ret = handle_declarator(decls, base_type, depth);
 
     return ret;
 }
@@ -1001,7 +1048,7 @@ static void assign_integer(tree var, tree right)
     }
 
     switch (TYPE(tLV_TYPE(var))) {
-        #define DEFCTYPE(TNAME, DESC, CTYPE, FMT)        \
+#define DEFCTYPE(TNAME, DESC, CTYPE, FMT, FFMEM)         \
             case TNAME:                                  \
                 tLV_VAL(var)->TNAME = (CTYPE)val; \
                 break;
@@ -1089,14 +1136,16 @@ static tree eval_assign(tree t, int depth)
         eval_die(t, "Unknown assignment rvalue type.");
     }
 
-    return NULL;
+    /* Return the value that was assigned, thereby making an assignment work as
+     * a rvalue. */
+    return right;
 }
 
 static void live_var_add(tree var, unsigned long int val)
 {
     tree type = tLV_TYPE(var);
     switch (TYPE(type)) {
-#define DEFCTYPE(TNAME, DESC, CTYPE, FMT)               \
+#define DEFCTYPE(TNAME, DESC, CTYPE, FMT, FFMEM)        \
         case TNAME:                                     \
             tLV_VAL(var)->TNAME += val;   \
             break;
@@ -1111,7 +1160,7 @@ static void live_var_sub(tree var, unsigned long int val)
 {
     tree type = tLV_TYPE(var);
     switch (TYPE(type)) {
-#define DEFCTYPE(TNAME, DESC, CTYPE, FMT)               \
+#define DEFCTYPE(TNAME, DESC, CTYPE, FMT, FFMEM)        \
         case TNAME:                                     \
             tLV_VAL(var)->TNAME -= val;   \
             break;
@@ -1301,6 +1350,28 @@ static tree eval_ior(tree t, int depth)
     return ret;
 }
 
+static tree eval_xor(tree t, int depth)
+{
+    tree left = __evaluate_1(tX_OR_LHS(t), depth + 1);
+    tree right = __evaluate_1(tX_OR_RHS(t), depth + 1);
+
+    tree ret = tree_make(T_INTEGER);
+    mpz_init(tINT_VAL(ret));
+
+    if (is_T_LIVE_VAR(left))
+        left = make_int_from_live_var(left);
+
+    if (is_T_LIVE_VAR(right))
+        right = make_int_from_live_var(right);
+
+    if (!(is_T_INTEGER(left) && is_T_INTEGER(right)))
+        eval_die(t, "Could not perform inclusive or on non-integer type\n");
+
+    mpz_xor(tINT_VAL(ret), tINT_VAL(left), tINT_VAL(right));
+
+    return ret;
+}
+
 static tree eval_iand(tree t, int depth)
 {
     tree left = __evaluate_1(tI_AND_LHS(t), depth + 1);
@@ -1369,6 +1440,33 @@ static tree eval_div(tree t, int depth)
     return ret;
 }
 
+static tree eval_mod(tree t, int depth)
+{
+    tree left = __evaluate_1(tMOD_LHS(t), depth + 1);
+    tree right = __evaluate_1(tMOD_RHS(t), depth + 1);
+
+    tree ret = tree_make(T_INTEGER);
+    mpz_init(tINT_VAL(ret));
+
+    if (is_T_LIVE_VAR(left))
+        left = make_int_from_live_var(left);
+
+    if (is_T_LIVE_VAR(right))
+        right = make_int_from_live_var(right);
+
+    if (!(is_T_INTEGER(left) && is_T_INTEGER(right)))
+        eval_die(t, "Could not modulus to non integer type\n");
+
+    mpz_tdiv_r(tINT_VAL(ret), tINT_VAL(left), tINT_VAL(right));
+
+    return ret;
+}
+
+static tree eval_comma(tree t, int depth)
+{
+    __evaluate_1(tCOMMA_LHS(t), depth + 1);
+    return __evaluate_1(tCOMMA_RHS(t), depth + 1);
+}
 
 static tree eval_lt(tree t, int depth)
 {
@@ -1634,43 +1732,43 @@ static tree eval_cast(tree t, int depth)
     }
 
 #pragma GCC diagnostic ignored "-Wint-to-pointer-cast"
-#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT)    \
+#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT, FFMEM) \
     DEFCAST(D_T_CHAR, ETYPE);
 #include "ctypes.def"
 #undef DEFCTYPE
-#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT)    \
+#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT, FFMEM) \
     DEFCAST(D_T_SHORT, ETYPE);
 #include "ctypes.def"
 #undef DEFCTYPE
-#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT)    \
+#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT, FFMEM)   \
     DEFCAST(D_T_INT, ETYPE);
 #include "ctypes.def"
 #undef DEFCTYPE
-#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT)    \
+#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT, FFMEM) \
     DEFCAST(D_T_LONG, ETYPE);
 #include "ctypes.def"
 #undef DEFCTYPE
-#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT)    \
+#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT, FFMEM) \
     DEFCAST(D_T_LONGLONG, ETYPE);
 #include "ctypes.def"
 #undef DEFCTYPE
-#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT)    \
+#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT, FFMEM)   \
     DEFCAST(D_T_UCHAR, ETYPE);
 #include "ctypes.def"
 #undef DEFCTYPE
-#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT)    \
+#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT, FFMEM)   \
     DEFCAST(D_T_USHORT, ETYPE);
 #include "ctypes.def"
 #undef DEFCTYPE
-#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT)    \
+#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT, FFMEM)   \
     DEFCAST(D_T_UINT, ETYPE);
 #include "ctypes.def"
 #undef DEFCTYPE
-#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT)    \
+#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT, FFMEM)   \
     DEFCAST(D_T_ULONG, ETYPE);
 #include "ctypes.def"
 #undef DEFCTYPE
-#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT)    \
+#define DEFCTYPE(ETYPE, DESC, STDINTSZ, FMT, FFMEM)   \
     DEFCAST(D_T_ULONGLONG, ETYPE);
 #include "ctypes.def"
 #undef DEFCTYPE
@@ -1737,7 +1835,7 @@ static tree eval_cast(tree t, int depth)
 }
 
 /* All types evaluate to themselves. */
-#define DEFCTYPE(TNAME, DESC, CTYPE, FMT)       \
+#define DEFCTYPE(TNAME, DESC, CTYPE, FMT, FFMEM)      \
     static tree eval_##TNAME(tree t, int depth) \
     {                                           \
         return t;                               \
@@ -1763,8 +1861,11 @@ static tree eval_loop_for(tree t, int depth)
             break;
 
         push_ctx("For Loop");
-        __evaluate(tFLOOP_STMTS(t), depth + 1);
+        tree ret = __evaluate(tFLOOP_STMTS(t), depth + 1);
         pop_ctx();
+
+        if (is_T_BREAK(ret))
+            return NULL;
 
         __evaluate_1(tFLOOP_AFTER(t), depth + 1);
 
@@ -1789,8 +1890,11 @@ static tree eval_loop_while(tree t, int depth)
             break;
 
         push_ctx("While Loop");
-        __evaluate(tWLOOP_STMTS(t), depth + 1);
+        tree ret = __evaluate(tWLOOP_STMTS(t), depth + 1);
         pop_ctx();
+
+        if (is_T_BREAK(ret))
+            return NULL;
 
     } while (1);
 
@@ -1858,22 +1962,24 @@ static tree eval_return(tree t, int depth)
  */
 static tree expand_decl_chain(tree decl_chain)
 {
-    tree tmp, decl, decl_element, new_chain = tree_make(CHAIN_HEAD);
+    tree tmp, decl, declarator, new_chain = tree_make(CHAIN_HEAD);
 
     for_each_tree_safe(decl, tmp, decl_chain) {
         if (is_T_DECL(decl) && tDECL_DECLS(decl))
-            for_each_tree(decl_element, tDECL_DECLS(decl)) {
+            for_each_tree(declarator, tDECL_DECLS(decl)) {
                 tree new_decl = tree_make(T_DECL);
 
+                /* If `declarator` is an unnamed bitfield skip over it. Since,
+                 * for now, we just make each bitfield a member in it's own
+                 * right. */
+                if (is_T_BITFIELD(declarator) && !tBITFIELD_DECLARATOR(declarator))
+                    continue;
+
                 tDECL_TYPE(new_decl) = tDECL_TYPE(decl);
-                tDECL_DECLS(new_decl) = decl_element;
+                tDECL_DECLS(new_decl) = declarator;
 
                 tree_chain(new_decl, new_chain);
             }
-
-        if (is_T_BITFIELD_EXPR(decl)) {
-            tree_chain(decl, new_chain);
-        }
     }
 
     return new_chain;
@@ -1960,12 +2066,6 @@ static tree eval_decl_compound(tree t, int depth)
         tree id, live_var, decl = i;
         size_t member_size, member_alignment, padding_size;
 
-        /* Since the layout of bit-fields is implementation defined,
-         * we can just treat bitfield declarations as separate live
-         * variables. */
-        if (is_T_BITFIELD_EXPR(decl))
-            decl = tBITFIELD_EXPR_DECL(decl);
-
         /* To calculate the size of each element of the compound, we
          * temporarily push the evaluation ctx, evaluate each decl
          * within the new evaluation ctx, resolve the identifier back
@@ -1979,6 +2079,7 @@ static tree eval_decl_compound(tree t, int depth)
         push_ctx("Compound Declaration");
 
         id = __evaluate_1(decl, depth + 1);
+
         live_var = resolve_identifier(id, SCOPE_CURRENT_CTX);
 
         /* Calculate the offset of the member within the struct.
@@ -2141,7 +2242,7 @@ static int get_ctype_size(tree t)
 {
     switch (TYPE(t))
     {
-#define DEFCTYPE(TNAME, DESC, CTYPE, FMT)       \
+#define DEFCTYPE(TNAME, DESC, CTYPE, FMT, FFMEM)  \
         case TNAME:                             \
             return sizeof(CTYPE);
 #include "ctypes.def"
@@ -2295,7 +2396,7 @@ static tree eval_cpp_include(tree t, int depth)
     tCPP_INCLUDE_STR(cpp_include) = strdup(tCPP_INCLUDE_STR(t));
     tree_chain(cpp_include, include_chain);
 
-    out_file_stream = run_cpp(include_chain, "-E -P", NULL);
+    out_file_stream = run_cpp(include_chain, "-E", NULL);
 
     cfilein = out_file_stream;
 
@@ -2385,12 +2486,15 @@ static tree __evaluate_1(tree t, int depth)
     case T_ADD:        result = eval_add(t, depth + 1);        break;
     case T_SUB:        result = eval_sub(t, depth + 1);        break;
     case T_NEGATE:     result = eval_negate(t, depth + 1);     break;
+    case T_X_OR:       result = eval_xor(t, depth + 1);        break;
     case T_I_OR:       result = eval_ior(t, depth + 1);        break;
     case T_I_AND:      result = eval_iand(t, depth + 1);       break;
     case T_LSHIFT:     result = eval_lshift(t, depth + 1);     break;
     case T_RSHIFT:     result = eval_rshift(t, depth + 1);     break;
     case T_MUL:        result = eval_mul(t, depth + 1);        break;
     case T_DIV:        result = eval_div(t, depth + 1);        break;
+    case T_MOD:        result = eval_mod(t, depth + 1);        break;
+    case T_COMMA:      result = eval_comma(t, depth + 1);      break;
     case T_LT:         result = eval_lt(t, depth + 1);         break;
     case T_GT:         result = eval_gt(t, depth + 1);         break;
     case T_LTEQ:       result = eval_lteq(t, depth + 1);       break;
@@ -2410,6 +2514,7 @@ static tree __evaluate_1(tree t, int depth)
     case T_INFIX:      result = eval_infix(t, depth + 1);      break;
     case T_IF:         result = eval_if(t, depth + 1);         break;
     case T_RETURN:     result = eval_return(t, depth + 1);     break;
+    case T_BREAK:      result = t;                             break;
     case T_DECL_COMPOUND:result = eval_decl_compound(t, depth + 1);break;
     case T_ENUMERATOR: result = eval_enumerator(t, depth + 1); break;
     case T_SIZEOF:     result = eval_sizeof(t, depth + 1);     break;
@@ -2425,7 +2530,8 @@ static tree __evaluate_1(tree t, int depth)
     case CPP_INCLUDE:  result = eval_cpp_include(t, depth + 1); break;
     case E_CTX:        result = eval_evaluator_ctx(t, depth + 1); break;
     case T_EXT_FUNC:   result = eval_ext_func(t, depth + 1);   break;
-#define DEFCTYPE(TNAME, DESC, CTYPE, FMT)                               \
+    case T_INSPECT:    result = eval_inspect(t, depth + 1);     break;
+#define DEFCTYPE(TNAME, DESC, CTYPE, FMT, FFMEM)                      \
     case TNAME:        result = eval_##TNAME(t, depth + 1);    break;
 #include "ctypes.def"
 #undef DEFCTYPE
@@ -2457,6 +2563,9 @@ static tree __evaluate(tree head, int depth)
             tECTX_RETVAL(fn_ctx) = tRET_EXP(result);
             longjmp(tECTX_JMP_BUF(fn_ctx), 1);
         }
+
+        if (is_T_BREAK(result))
+            return result;
     }
 
     return result;
